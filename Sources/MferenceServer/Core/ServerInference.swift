@@ -191,10 +191,13 @@ public actor ServerModelSession: ServerInferenceBackend {
     private let promptCacheMode: ServerPromptCacheMode
     private let promptCacheDomain: ServerPromptCacheDomain
     private var promptCache = ServerPromptCache()
+    /// The expert-cache profile actually in force, for the ready line and /health.
+    public private(set) var expertProfile: String = ""
 
     public static func load(modelDirectory: URL,
                             maxContext: Int,
-                            promptCacheMode: ServerPromptCacheMode = .singlePrefix) async throws -> ServerModelSession {
+                            promptCacheMode: ServerPromptCacheMode = .singlePrefix,
+                            expertCacheSlots: Int? = nil) async throws -> ServerModelSession {
         let family = try ManifestReader.peekFamily(directoryURL: modelDirectory)
         let tokenizerFolder = MFTokenizer.tokenizerFolder(forModelDirectory: modelDirectory)
         guard let tokenizerFolder else {
@@ -215,12 +218,21 @@ public actor ServerModelSession: ServerInferenceBackend {
             throw MFTokenizerError.missingToolTemplate
         }
         let context = try MetalContext()
-        let streamingMode = RuntimeConfiguration.defaultExpertStreamingMode(
-            for: family,
-            expertPoolBytes: try ExpertPoolInspector.poolByteSize(
-                directoryURL: modelDirectory),
-            coreWeightsBytes: try ExpertPoolInspector.coreWeightsByteSize(
-                directoryURL: modelDirectory))
+        // An explicit --expert-cache-slots overrides the RAM-based rule. Slots trade
+        // memory for speed: fewer slots wire less memory and read more from SSD. The
+        // default rule gives Qwen 3.6 96 slots (~6.8 GB) on a host with >= 24 GiB, which
+        // is not always the trade the operator wants.
+        let streamingMode: ExpertStreamingMode
+        if let expertCacheSlots {
+            streamingMode = .pread(slotCount: expertCacheSlots)
+        } else {
+            streamingMode = RuntimeConfiguration.defaultExpertStreamingMode(
+                for: family,
+                expertPoolBytes: try ExpertPoolInspector.poolByteSize(
+                    directoryURL: modelDirectory),
+                coreWeightsBytes: try ExpertPoolInspector.coreWeightsByteSize(
+                    directoryURL: modelDirectory))
+        }
         let configSlots: Int
         switch streamingMode {
         case .pread(let slots): configSlots = slots

@@ -1,4 +1,5 @@
 import Foundation
+import Mference
 
 public struct ServerArguments: Equatable, Sendable {
     public let model: String
@@ -11,6 +12,9 @@ public struct ServerArguments: Equatable, Sendable {
     public let maxContext: Int
     public let queueLimit: Int
     public let promptCacheMode: ServerPromptCacheMode
+    /// Routed-expert cache slots. nil keeps RuntimeConfiguration's RAM-based rule,
+    /// which gives Qwen 3.6 96 slots (~6.8 GB wired) on a host with >= 24 GiB.
+    public let expertCacheSlots: Int?
 
     public static let usage = """
     usage: MferenceServer --model <completed .gturbo directory> [options]
@@ -28,6 +32,14 @@ public struct ServerArguments: Equatable, Sendable {
       --queue-limit <count>  Maximum queued requests (default 4).
       --prompt-cache-mode <off|single-prefix>
                              Prompt KV reuse mode (default single-prefix).
+      --expert-cache-slots <n>
+                             Routed-expert cache slots per layer: 16, 24, 32,
+                             64, 96, or 128 (default: chosen from host RAM --
+                             Qwen 3.6 gets 96 on >= 24 GiB, 32 on >= 16 GiB,
+                             else 16). Fewer slots use less memory and read
+                             more from SSD; more slots are faster. 16 is the
+                             floor for chunked prefill and has no headroom, so
+                             32 is the smallest generally advisable value.
       --help                 Show this help.
     """
 
@@ -39,6 +51,7 @@ public struct ServerArguments: Equatable, Sendable {
         var maxContext = 16_384
         var queueLimit = 4
         var promptCacheMode: ServerPromptCacheMode = .singlePrefix
+        var expertCacheSlots: Int? = nil
         var index = 0
         while index < input.count {
             let flag = input[index]
@@ -77,6 +90,22 @@ public struct ServerArguments: Equatable, Sendable {
                     throw ServerArgumentError.invalid("--queue-limit must be positive")
                 }
                 queueLimit = parsed
+            case "--expert-cache-slots":
+                guard let parsed = Int(value),
+                      RuntimeConfiguration.allowedExpertCacheSlots.contains(parsed) else {
+                    throw ServerArgumentError.invalid(
+                        "--expert-cache-slots must be one of "
+                            + RuntimeConfiguration.allowedExpertCacheSlots
+                                .map(String.init).joined(separator: ", "))
+                }
+                // 8 is an allowed rung for the CLI but cannot satisfy chunked prefill:
+                // PrefillRoutedTileScheduler needs (maxPendingDepth + 1) * tileExperts
+                // slots, which is 16. Refusing here beats throwing mid-generation.
+                guard parsed >= 16 else {
+                    throw ServerArgumentError.invalid(
+                        "--expert-cache-slots 8 cannot serve chunked prefill; 16 is the floor")
+                }
+                expertCacheSlots = parsed
             case "--prompt-cache-mode":
                 guard let parsed = ServerPromptCacheMode(rawValue: value) else {
                     throw ServerArgumentError.invalid(
@@ -94,7 +123,8 @@ public struct ServerArguments: Equatable, Sendable {
                                modelIDOverride: modelIDOverride,
                                maxContext: maxContext,
                                queueLimit: queueLimit,
-                               promptCacheMode: promptCacheMode)
+                               promptCacheMode: promptCacheMode,
+                               expertCacheSlots: expertCacheSlots)
     }
 }
 
