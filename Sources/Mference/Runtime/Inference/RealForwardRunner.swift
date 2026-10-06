@@ -174,6 +174,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     private let model: Model
     private let ctx: MetalContext
     private let kv: KVCacheManager?
+    /// Paged full-attention KV (Qwen 3.6 mask-1 layers) when `kvPagedPolicy == .on`.
+    private let pagedKV: Qwen38PagedKVRuntime?
+    private var blockedPrefillScratch: PagedKVPrefill.Scratch?
     private let cfg: ArchConfig
 
     // Kernels
@@ -558,6 +561,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 byteCap: Self.rdadviseAdaptiveByteCap,
                 slowCallNanos: Self.rdadviseAdaptiveSlowCallNanos))
         self.rdadviseEnabled = runtimeConfiguration.rdadviseEnabled
+        let paged = runtimeConfiguration.kvPagedPolicy == .on
+            && cfg.family == .qwen36
         self.kv = try KVCacheManager(device: context.device,
                                      config: cfg,
                                      maxContext: maxContext,
@@ -567,7 +572,16 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                      // sliding-window ring memory grows only
                                      // when a larger prefill chunk is opted
                                      // into, never from the static cap.
-                                     maxPrefillChunkTokens: runtimeConfiguration.prefillConfig.chunkTokens)
+                                     maxPrefillChunkTokens: runtimeConfiguration.prefillConfig.chunkTokens,
+                                     pagedFullAttention: paged)
+        if paged {
+            self.pagedKV = try Qwen38PagedKVRuntime(context: context,
+                                                    config: cfg,
+                                                    maxContext: maxContext,
+                                                    runtimeConfiguration: runtimeConfiguration)
+        } else {
+            self.pagedKV = nil
+        }
 
         let silu = cfg.hiddenActivation == "silu"
         self.embedInt4 = try EmbedLookupInt4(context: context)
@@ -972,6 +986,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
 
     public func reset() {
         kv?.reset()
+        pagedKV?.resetState()
         gdnState?.reset()
         dsv4State?.reset()
         // Short-conv history dies with the KV cache, and ONLY with it:
@@ -2106,8 +2121,88 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                                eps: eps)
                 }
 
-                if let kv {
-                    let bytes = t * kvDim * MemoryLayout<Float16>.stride
+                let bytesPerToken = kvDim * MemoryLayout<Float16>.stride
+                if let paged = pagedKV, isFull {
+                    let endPages = (startPosition + t + KVPageGeometry.tokensPerPage - 1)
+                        / KVPageGeometry.tokensPerPage
+                    try PagedKVPrefill.scatter(commandBuffer: cb,
+                                               paged: paged,
+                                               layerIndex: L,
+                                               startPosition: startPosition,
+                                               tokenCount: t,
+                                               keySource: scratch.kStage,
+                                               valueSource: scratch.vStage,
+                                               bytesPerToken: bytesPerToken)
+                    try PagedKVPrefill.encodeSealedPageMinMax(commandBuffer: cb,
+                                                              paged: paged,
+                                                              config: cfg,
+                                                              layerIndex: L,
+                                                              startPosition: startPosition,
+                                                              tokenCount: t)
+                    if !(paged.store.identityMappingIntact
+                         && endPages <= paged.poolPagesPerLayer) {
+                        cb.commit()
+                        waitForCompletion(cb)
+                        if let error = cb.error { throw error }
+                        let blocked: PagedKVPrefill.Scratch
+                        if let existing = blockedPrefillScratch,
+                           existing.chunkTokens >= t {
+                            blocked = existing
+                        } else {
+                            blocked = try PagedKVPrefill.Scratch(
+                                device: ctx.device,
+                                config: cfg,
+                                chunkTokens: max(t, scratch.layout.chunkTokens),
+                                kPageBytes: paged.store.geometry.kPageBytes)
+                            blockedPrefillScratch = blocked
+                        }
+                        try PagedKVPrefill.runBlockedAttention(
+                            paged: paged,
+                            blocked: blocked,
+                            config: cfg,
+                            layerIndex: L,
+                            queryCount: t,
+                            startPosition: startPosition,
+                            query: attnQ,
+                            output: scratch.attentionOutput,
+                            makeCommandBuffer: {
+                                guard let next = self.ctx.queue.makeCommandBuffer() else {
+                                    throw ModelError.residentBufferWrapFailed
+                                }
+                                return next
+                            },
+                            finish: { tail in
+                                tail.commit()
+                                self.waitForCompletion(tail)
+                                if let error = tail.error { throw error }
+                            })
+                        guard let nextCB = ctx.queue.makeCommandBuffer() else {
+                            throw ModelError.residentBufferWrapFailed
+                        }
+                        cb = nextCB
+                    } else {
+                        let params = PrefillAttentionParams(
+                            startPosition: UInt32(startPosition),
+                            queryCount: UInt32(t),
+                            headDim: UInt32(headDim),
+                            numQHeads: UInt32(cfg.numHeads),
+                            numKVHeads: UInt32(numKVHeads),
+                            kvValidCount: UInt32(startPosition + t),
+                            slidingWindow: UInt32(startPosition + t),
+                            kvTokenStrideElements: UInt32(kvDim),
+                            qTokenStrideElements: UInt32(qDim),
+                            oTokenStrideElements: UInt32(qDim),
+                            scale: Float(cfg.attentionScale))
+                        prefillAttention.encodeCausal(commandBuffer: cb,
+                                                      q: attnQ,
+                                                      k: paged.store.kPoolBuffer(layer: L),
+                                                      v: paged.store.vPoolBuffer(layer: L),
+                                                      out: scratch.attentionOutput,
+                                                      params: params,
+                                                      kvRingCapacity: 0,
+                                                      path: prefillAttentionPath)
+                    }
+                } else if let kv {
                     try copyPrefillKVToCache(commandBuffer: cb,
                                              kv: kv,
                                              layer: L,
@@ -2115,9 +2210,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                              tokenCount: t,
                                              keySource: scratch.kStage,
                                              valueSource: scratch.vStage,
-                                             bytesPerToken: bytes / t)
-                }
-                let params = PrefillAttentionParams(
+                                             bytesPerToken: bytesPerToken)
+                    let params = PrefillAttentionParams(
                         startPosition: UInt32(startPosition),
                         queryCount: UInt32(t),
                         headDim: UInt32(headDim),
@@ -2129,21 +2223,20 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                         qTokenStrideElements: UInt32(qDim),
                         oTokenStrideElements: UInt32(qDim),
                         scale: Float(cfg.attentionScale))
-                if let kv {
-                        let keyBuffer = kv.keyBuffer(layer: L, validTokenCount: startPosition + t)
-                        let valueBuffer = kv.valueBuffer(layer: L, validTokenCount: startPosition + t)
-                        let ringCapacity = kv.ringCapacity(layer: L)
-                        let activeRingCapacity = ringCapacity > 0 && startPosition + t > ringCapacity
-                            ? UInt32(ringCapacity)
-                            : 0
-                        prefillAttention.encodeCausal(commandBuffer: cb,
-                                                      q: attnQ,
-                                                      k: keyBuffer,
-                                                      v: valueBuffer,
-                                                      out: scratch.attentionOutput,
-                                                      params: params,
-                                                      kvRingCapacity: activeRingCapacity,
-                                                      path: prefillAttentionPath)
+                    let keyBuffer = kv.keyBuffer(layer: L, validTokenCount: startPosition + t)
+                    let valueBuffer = kv.valueBuffer(layer: L, validTokenCount: startPosition + t)
+                    let ringCapacity = kv.ringCapacity(layer: L)
+                    let activeRingCapacity = ringCapacity > 0 && startPosition + t > ringCapacity
+                        ? UInt32(ringCapacity)
+                        : 0
+                    prefillAttention.encodeCausal(commandBuffer: cb,
+                                                  q: attnQ,
+                                                  k: keyBuffer,
+                                                  v: valueBuffer,
+                                                  out: scratch.attentionOutput,
+                                                  params: params,
+                                                  kvRingCapacity: activeRingCapacity,
+                                                  path: prefillAttentionPath)
                 } else {
                     throw PrefillError.chunkedUnsupported(
                         "chunked prefill attention requires FP16 KV")
@@ -2581,6 +2674,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             }
         }
 
+        if let paged = pagedKV {
+            paged.store.advance(by: tokens.count)
+            for i in 0..<paged.lastScores.count { paged.lastScores[i] = [] }
+        }
         kv?.advance(by: tokens.count)
         prefillChunkState.markCommitted()
     }
@@ -2610,6 +2707,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                           into: logits, emitHead: emitHead,
                                           outputMode: outputMode)
             return
+        }
+        if let paged = pagedKV {
+            try paged.prepareSelections(position: position)
         }
         let D    = UInt32(cfg.hiddenSize)
         let FmoE = UInt32(cfg.moeIntermediateSize)
@@ -2702,6 +2802,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             // the only reason to break is the CPU readback of router indices
             // needed to issue I/O for the routed-expert blobs.
             let cb = ctx.queue.makeCommandBuffer()!
+            if L == 0, let paged = pagedKV {
+                try paged.encodePendingMetadata(commandBuffer: cb)
+            }
             rms.encodeBF16W(commandBuffer: cb,
                             x: hidden,
                             weight: inNorm.buffer, weightOffset: Int(inNorm.offset),
@@ -3335,6 +3438,11 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             }
         }
 
+        if let paged = pagedKV {
+            paged.readBackScores(sealedPages: position / KVPageGeometry.tokensPerPage)
+            paged.store.advance()
+            paged.noteAdvance(from: position, to: position + 1)
+        }
         kv?.advance()
     }
 
@@ -4729,8 +4837,15 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         let numKV = cfg.numFullKVHeads
         let qDim = UInt32(cfg.numHeads * headDim)
         let kvDim = UInt32(numKV * headDim)
-        let kSlot = kv.kSlot(layer: L, position: position)
-        let vSlot = kv.vSlot(layer: L, position: position)
+        let kSlot: (buffer: MTLBuffer, offset: Int)
+        let vSlot: (buffer: MTLBuffer, offset: Int)
+        if let paged = pagedKV {
+            kSlot = try paged.store.kSlot(layer: L, position: position)
+            vSlot = try paged.store.vSlot(layer: L, position: position)
+        } else {
+            kSlot = kv.kSlot(layer: L, position: position)
+            vSlot = kv.vSlot(layer: L, position: position)
+        }
         let q = try model.qProj(layer: L)
         let k = try model.kProj(layer: L)
         let v = try model.vProj(layer: L)
@@ -4793,16 +4908,40 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                               numHeads: UInt32(numKV),
                               rotaryDim: rotaryDim,
                               theta: Float(cfg.fullRopeTheta))
-        attention.encodeFull(commandBuffer: cb,
-                             q: qScratch,
-                             k: kSlot.buffer, kOffset: 0,
-                             v: vSlot.buffer, vOffset: 0,
-                             out: attnOut,
-                             headDim: UInt32(headDim),
-                             numQHeads: UInt32(cfg.numHeads),
-                             numKVHeads: UInt32(numKV),
-                             seqLen: seqLen,
-                             scale: Float(cfg.attentionScale))
+        if let paged = pagedKV {
+            let g = paged.store.geometry
+            guard let ordinal = paged.store.fullLayerOrdinal(forLayer: L) else {
+                preconditionFailure("paged decode on a non-full-attention layer")
+            }
+            let selection = paged.selections[ordinal]
+            attention.encodeFullPaged(commandBuffer: cb,
+                                      q: qScratch,
+                                      kPool: paged.store.kPoolBuffer(layer: L),
+                                      vPool: paged.store.vPoolBuffer(layer: L),
+                                      pageTable: paged.tablesBuf,
+                                      pageTableOffset: ordinal * g.pagesPerLayer
+                                          * MemoryLayout<UInt32>.stride,
+                                      out: attnOut,
+                                      headDim: UInt32(headDim),
+                                      numQHeads: UInt32(cfg.numHeads),
+                                      numKVHeads: UInt32(numKV),
+                                      selTokens: UInt32(selection.selTokens),
+                                      scale: Float(cfg.attentionScale))
+            paged.encodeScores(commandBuffer: cb, ordinal: ordinal,
+                               q: qScratch, qOffset: 0,
+                               sealedPages: position / KVPageGeometry.tokensPerPage)
+        } else {
+            attention.encodeFull(commandBuffer: cb,
+                                 q: qScratch,
+                                 k: kSlot.buffer, kOffset: 0,
+                                 v: vSlot.buffer, vOffset: 0,
+                                 out: attnOut,
+                                 headDim: UInt32(headDim),
+                                 numQHeads: UInt32(cfg.numHeads),
+                                 numKVHeads: UInt32(numKV),
+                                 seqLen: seqLen,
+                                 scale: Float(cfg.attentionScale))
+        }
         elementwise.encodeSigmoidGateMul(commandBuffer: cb,
                                          out: attnOut,
                                          gate: attnGateScratch,

@@ -26,13 +26,16 @@ public struct ServerCompletion: Equatable, Sendable {
 
 /// A request that has been rendered and measured against the context window.
 public struct PreparedGeneration: Sendable {
+    public let id: String?
     public let request: ValidatedChatRequest
     public let promptIDs: [Int32]
     public let needsToolTemplate: Bool
 
-    public init(request: ValidatedChatRequest,
+    public init(id: String? = nil,
+                request: ValidatedChatRequest,
                 promptIDs: [Int32] = [],
                 needsToolTemplate: Bool = false) {
+        self.id = id
         self.request = request
         self.promptIDs = promptIDs
         self.needsToolTemplate = needsToolTemplate
@@ -194,7 +197,11 @@ public actor ServerModelSession: ServerInferenceBackend {
 
     public static func load(modelDirectory: URL,
                             maxContext: Int,
-                            promptCacheMode: ServerPromptCacheMode = .singlePrefix) async throws -> ServerModelSession {
+                            promptCacheMode: ServerPromptCacheMode = .singlePrefix,
+                            expertCacheSlots: Int? = nil,
+                            kvPaged: ServerKVPagedMode = .auto,
+                            kvPoolPages: Int? = nil,
+                            kvTopKPages: Int? = nil) async throws -> ServerModelSession {
         let family = try ManifestReader.peekFamily(directoryURL: modelDirectory)
         let tokenizerFolder = MFTokenizer.tokenizerFolder(forModelDirectory: modelDirectory)
         guard let tokenizerFolder else {
@@ -215,21 +222,31 @@ public actor ServerModelSession: ServerInferenceBackend {
             throw MFTokenizerError.missingToolTemplate
         }
         let context = try MetalContext()
-        let streamingMode = RuntimeConfiguration.defaultExpertStreamingMode(
-            for: family,
-            expertPoolBytes: try ExpertPoolInspector.poolByteSize(
-                directoryURL: modelDirectory),
-            coreWeightsBytes: try ExpertPoolInspector.coreWeightsByteSize(
-                directoryURL: modelDirectory))
+        let streamingMode: ExpertStreamingMode
+        if let expertCacheSlots {
+            streamingMode = .pread(slotCount: expertCacheSlots)
+        } else {
+            streamingMode = RuntimeConfiguration.defaultExpertStreamingMode(
+                for: family,
+                expertPoolBytes: try ExpertPoolInspector.poolByteSize(
+                    directoryURL: modelDirectory),
+                coreWeightsBytes: try ExpertPoolInspector.coreWeightsByteSize(
+                    directoryURL: modelDirectory))
+        }
         let configSlots: Int
         switch streamingMode {
         case .pread(let slots): configSlots = slots
         case .resident:
             configSlots = RuntimeConfiguration.allowedExpertCacheSlots.max()!
         }
+        let pagedOn = kvPaged.resolved(maxContext: maxContext) == .on
+        let kvPagedPolicy: RuntimeKVPagedPolicy = pagedOn ? .on : .off
         let runtime = RuntimeConfiguration(
             expertCacheSlots: configSlots,
-            forceLogitsHead: true)
+            forceLogitsHead: true,
+            kvPagedPolicy: kvPagedPolicy,
+            kvTopKPages: kvTopKPages ?? (pagedOn ? 36 : 60),
+            kvPoolPagesPerLayer: kvPoolPages ?? (pagedOn ? 48 : nil))
         let model = try Model.load(
             directoryURL: modelDirectory,
             device: context.device,
@@ -245,6 +262,7 @@ public actor ServerModelSession: ServerInferenceBackend {
         let templateDigest = SHA256.hash(data: templateData)
             .map { String(format: "%02x", $0) }
             .joined()
+        let poolIdentity = String(runtime.kvPoolPagesPerLayer ?? 0)
         let runtimeIdentity = [
             String(runtime.expertCacheSlots),
             runtime.expertCachePolicy.rawValue,
@@ -252,6 +270,9 @@ public actor ServerModelSession: ServerInferenceBackend {
             forwardRuntime.prefillConfig.mode.rawValue,
             String(forwardRuntime.prefillConfig.chunkTokens),
             runtime.headPath.rawValue,
+            runtime.kvPagedPolicy.rawValue,
+            poolIdentity,
+            String(runtime.kvTopKPages),
         ].joined(separator: ":")
         let runtimeDigest = SHA256.hash(data: Data(runtimeIdentity.utf8))
             .map { String(format: "%02x", $0) }
@@ -340,6 +361,7 @@ public actor ServerModelSession: ServerInferenceBackend {
 
         let effectivePromptIDs: [Int32]
         let completionStart: RawCompletionStart
+        let cachedPromptTokens: Int
         if promptCacheMode == .singlePrefix {
             switch promptCache.match(
                 domain: promptCacheDomain,
@@ -350,14 +372,17 @@ public actor ServerModelSession: ServerInferenceBackend {
                 promptCache.invalidate()
                 effectivePromptIDs = promptIDs
                 completionStart = .reset
+                cachedPromptTokens = 0
             case .hit(let effective, let cached):
                 effectivePromptIDs = effective
                 completionStart = .resume(cachedPromptTokens: cached)
+                cachedPromptTokens = cached
             }
         } else {
             promptCache.invalidate()
             effectivePromptIDs = promptIDs
             completionStart = .reset
+            cachedPromptTokens = 0
         }
         guard effectivePromptIDs.count < maxContext else {
             throw ServerRequestError.invalid(
@@ -365,6 +390,12 @@ public actor ServerModelSession: ServerInferenceBackend {
                 param: "messages",
                 code: "context_length_exceeded")
         }
+
+        ServerLog.requestStarted(
+            id: prepared.id ?? "",
+            promptTokens: promptIDs.count,
+            cachedTokens: cachedPromptTokens,
+            streaming: request.stream)
 
         var config = request.generationConfig
         config.maxNewTokens = min(
@@ -449,20 +480,39 @@ public actor ServerModelSession: ServerInferenceBackend {
                     shouldStop = true
                 }
         }
-        if let decodingError { throw decodingError }
+        if let decodingError {
+            // An unclosed / truncated tool-call block used to 500 the stream.
+            // pi-ai maps that to PI_AI_ERROR and Mesh kills the whole turn
+            // (Bake-off Qwen, 2026-09-02: 5.6 min write() then "generation failed").
+            if decodingError is ToolCallParserError {
+                ServerLog.streamAborted(
+                    id: prepared.id ?? "",
+                    reason: "tool markup truncated or unparsable; finishing as length")
+            } else {
+                throw decodingError
+            }
+        }
         if let decoder {
-            for event in try decoder.finish() {
-                if case .content(let text) = event {
-                    let visible = stopMatcher.push(text)
-                    if !visible.isEmpty {
-                        content += visible
-                        onEvent(.content(visible))
+            do {
+                for event in try decoder.finish() {
+                    if case .content(let text) = event {
+                        let visible = stopMatcher.push(text)
+                        if !visible.isEmpty {
+                            content += visible
+                            onEvent(.content(visible))
+                        }
                     }
                 }
+            } catch is ToolCallParserError {
+                ServerLog.streamAborted(
+                    id: prepared.id ?? "",
+                    reason: "unclosed tool-call block at end of stream")
             }
         }
         if needsToolTemplate, result.reason == .toolCalls, calls.isEmpty {
-            throw GemmaToolCallParserError.malformed
+            ServerLog.streamAborted(
+                id: prepared.id ?? "",
+                reason: "tool-call stop with no parsed calls")
         }
         let tail = stopMatcher.finish()
         if !tail.isEmpty {

@@ -663,6 +663,31 @@ struct ServerArgumentTests {
         #expect(arguments.maxContext == 16_384)
         #expect(arguments.queueLimit == 4)
         #expect(arguments.promptCacheMode == .singlePrefix)
+        #expect(arguments.expertCacheSlots == nil)
+        #expect(arguments.kvPaged == .auto)
+        #expect(arguments.kvPoolPages == nil)
+    }
+
+    @Test func parsesKvPagedAndPool() throws {
+        let on = try ServerArguments.parse([
+            "--model", "model.gturbo",
+            "--kv-paged", "on",
+            "--kv-pool-pages", "48",
+            "--kv-top-k-pages", "36",
+        ])
+        #expect(on.kvPaged == .on)
+        #expect(on.kvPoolPages == 48)
+        #expect(on.kvTopKPages == 36)
+        #expect(on.kvPaged.resolved(maxContext: 16_384) == .on)
+        #expect(ServerKVPagedMode.auto.resolved(maxContext: 16_384) == .off)
+        #expect(ServerKVPagedMode.auto.resolved(maxContext: 32_768) == .on)
+        #expect(ServerArguments.usage.contains("kv-paged"))
+        #expect(throws: ServerArgumentError.self) {
+            try ServerArguments.parse([
+                "--model", "model.gturbo",
+                "--kv-paged", "maybe",
+            ])
+        }
     }
 
     @Test func parsesAndAdvertises128KContext() throws {
@@ -689,6 +714,21 @@ struct ServerArgumentTests {
             try ServerArguments.parse([
                 "--model", "model.gturbo",
                 "--prompt-cache-mode", "many",
+            ])
+        }
+    }
+
+    @Test func parsesExpertCacheSlotsAndRejectsUnknownCount() throws {
+        let sixteen = try ServerArguments.parse([
+            "--model", "model.gturbo",
+            "--expert-cache-slots", "16",
+        ])
+        #expect(sixteen.expertCacheSlots == 16)
+        #expect(ServerArguments.usage.contains("expert-cache-slots"))
+        #expect(throws: ServerArgumentError.self) {
+            try ServerArguments.parse([
+                "--model", "model.gturbo",
+                "--expert-cache-slots", "12",
             ])
         }
     }

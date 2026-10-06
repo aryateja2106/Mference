@@ -227,7 +227,15 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
                       streamState.start(eventLoop: contextBox.value.eventLoop,
                                         interval: self.heartbeatInterval,
                                         ping: {
+                          // SSE comments (: ping) do not reset pi-ai's
+                          // streamIdleTimeoutMs — it only rearms on parsed
+                          // StreamChunks. An empty delta frame does.
                           self.writeHeartbeat(contextBox.value)
+                          self.writeStreamChunk(
+                              contextBox.value,
+                              self.chunk(id: responseID, created: created,
+                                         delta: [:],
+                                         finishReason: nil))
                       }) else { return }
                 self.beginStream(contextBox.value)
                 self.writeStreamChunk(
@@ -239,7 +247,6 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
             activeTask = childChannels.startTask {
                 defer { streamState.stop() }
                 let started = ContinuousClock.now
-                ServerLog.requestStarted(id: responseID, streaming: request.stream)
                 do {
                     // Rendering and the context check happen before the head
                     // is written, so a rejected prompt still gets a status
@@ -248,7 +255,14 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
                     // bound for a 429 is never rendered at all.
                     let completion = try await self.coordinator.run(
                         onQueued: startStream,
-                        render: { try await self.backend.prepare(request) }
+                        render: {
+                            let prepared = try await self.backend.prepare(request)
+                            return PreparedGeneration(
+                                id: responseID,
+                                request: prepared.request,
+                                promptIDs: prepared.promptIDs,
+                                needsToolTemplate: prepared.needsToolTemplate)
+                        }
                     ) { prepared in
                         startStream()
                         return try await self.backend.generate(prepared) { event in
