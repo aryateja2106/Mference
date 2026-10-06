@@ -11,6 +11,16 @@ public struct ServerArguments: Equatable, Sendable {
     public let maxContext: Int
     public let queueLimit: Int
     public let promptCacheMode: ServerPromptCacheMode
+    /// Explicit expert-cache slot count. nil keeps the RAM auto profile
+    /// (96 slots on ≥24 GiB). 16 is the ~1.45 GB Qwen working set.
+    public let expertCacheSlots: Int?
+    /// off | on | auto. auto turns paged KV on above 16K so 32K+ does not
+    /// allocate a linear full-attn cache.
+    public let kvPaged: ServerKVPagedMode
+    /// Resident pages per full-attention layer. nil uses 48 when paged is on
+    /// (the ~60 MB Qwen 3.6 hot pool) or the RAM auto budget otherwise.
+    public let kvPoolPages: Int?
+    public let kvTopKPages: Int?
 
     public static let usage = """
     usage: MferenceServer --model <completed .gturbo directory> [options]
@@ -28,6 +38,15 @@ public struct ServerArguments: Equatable, Sendable {
       --queue-limit <count>  Maximum queued requests (default 4).
       --prompt-cache-mode <off|single-prefix>
                              Prompt KV reuse mode (default single-prefix).
+      --expert-cache-slots <8|16|24|32|64|96|128>
+                             Routed-expert LFU slots. Default is RAM auto
+                             (96 on ≥24 GiB). Pass 16 for the ~1.45 GB profile.
+      --kv-paged <off|on|auto>
+                             Paged full-attention KV with SSD spill. auto is
+                             on when --max-context is greater than 16384.
+      --kv-pool-pages <n>    Hot pages per full-attention layer (default 48
+                             when paged is on — ~60 MB for Qwen 3.6).
+      --kv-top-k-pages <n>   Quest top-k pages (default 36 when paged is on).
       --help                 Show this help.
     """
 
@@ -39,6 +58,10 @@ public struct ServerArguments: Equatable, Sendable {
         var maxContext = 16_384
         var queueLimit = 4
         var promptCacheMode: ServerPromptCacheMode = .singlePrefix
+        var expertCacheSlots: Int?
+        var kvPaged: ServerKVPagedMode = .auto
+        var kvPoolPages: Int?
+        var kvTopKPages: Int?
         var index = 0
         while index < input.count {
             let flag = input[index]
@@ -83,6 +106,28 @@ public struct ServerArguments: Equatable, Sendable {
                         "--prompt-cache-mode must be off or single-prefix")
                 }
                 promptCacheMode = parsed
+            case "--expert-cache-slots":
+                guard let parsed = Int(value),
+                      [8, 16, 24, 32, 64, 96, 128].contains(parsed) else {
+                    throw ServerArgumentError.invalid(
+                        "--expert-cache-slots must be 8, 16, 24, 32, 64, 96, or 128")
+                }
+                expertCacheSlots = parsed
+            case "--kv-paged":
+                guard let parsed = ServerKVPagedMode(rawValue: value) else {
+                    throw ServerArgumentError.invalid("--kv-paged must be off, on, or auto")
+                }
+                kvPaged = parsed
+            case "--kv-pool-pages":
+                guard let parsed = Int(value), parsed >= 8, parsed <= 2048 else {
+                    throw ServerArgumentError.invalid("--kv-pool-pages must be 8...2048")
+                }
+                kvPoolPages = parsed
+            case "--kv-top-k-pages":
+                guard let parsed = Int(value), parsed >= 1, parsed <= 256 else {
+                    throw ServerArgumentError.invalid("--kv-top-k-pages must be 1...256")
+                }
+                kvTopKPages = parsed
             default:
                 throw ServerArgumentError.invalid("unknown flag: \(flag)")
             }
@@ -94,7 +139,11 @@ public struct ServerArguments: Equatable, Sendable {
                                modelIDOverride: modelIDOverride,
                                maxContext: maxContext,
                                queueLimit: queueLimit,
-                               promptCacheMode: promptCacheMode)
+                               promptCacheMode: promptCacheMode,
+                               expertCacheSlots: expertCacheSlots,
+                               kvPaged: kvPaged,
+                               kvPoolPages: kvPoolPages,
+                               kvTopKPages: kvTopKPages)
     }
 }
 
@@ -179,6 +228,20 @@ public enum ServerBindMode: String, Equatable, Sendable {
             throw ServerArgumentError.invalid("tailscale ip -4 returned non-UTF-8 output")
         }
         return text
+    }
+}
+
+public enum ServerKVPagedMode: String, Equatable, Sendable {
+    case off
+    case on
+    case auto
+
+    /// Collapses `auto` using the context length. `.on` / `.off` stay as-is.
+    func resolved(maxContext: Int) -> ServerKVPagedMode {
+        switch self {
+        case .off, .on: return self
+        case .auto: return maxContext > 16_384 ? .on : .off
+        }
     }
 }
 

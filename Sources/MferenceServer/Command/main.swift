@@ -20,7 +20,11 @@ do {
     let backend = try await ServerModelSession.load(
         modelDirectory: modelURL,
         maxContext: arguments.maxContext,
-        promptCacheMode: arguments.promptCacheMode)
+        promptCacheMode: arguments.promptCacheMode,
+        expertCacheSlots: arguments.expertCacheSlots,
+        kvPaged: arguments.kvPaged,
+        kvPoolPages: arguments.kvPoolPages,
+        kvTopKPages: arguments.kvTopKPages)
     let modelID = arguments.modelIDOverride ?? backend.defaultModelID
     let server = MferenceHTTPServer(
         modelID: modelID,
@@ -28,7 +32,7 @@ do {
         backend: backend,
         chatDialect: backend.chatDialect)
     _ = try await server.start(host: host, port: arguments.port)
-    print("MferenceServer ready at http://\(host):\(arguments.port) model=\(modelID) context=\(arguments.maxContext) prompt_cache=\(arguments.promptCacheMode.rawValue)")
+    print("MferenceServer ready at http://\(host):\(arguments.port) model=\(modelID) context=\(arguments.maxContext) prompt_cache=\(arguments.promptCacheMode.rawValue) expert_slots=\(arguments.expertCacheSlots.map(String.init) ?? "auto") kv_paged=\(arguments.kvPaged.rawValue) kv_pool=\(arguments.kvPoolPages.map(String.init) ?? "auto")")
     // Supervisors watch for the ready line through a pipe or log file, where
     // stdout is block-buffered and would otherwise hold it back indefinitely.
     fflush(stdout)
